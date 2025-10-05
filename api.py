@@ -1,11 +1,11 @@
-# api.py
 from __future__ import annotations
 
 import os
 import json
 import hashlib
+import uuid
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Literal, Tuple
+from typing import List, Optional, Literal, Tuple, Dict
 
 import httpx
 from fastapi import FastAPI, HTTPException, Depends, Query
@@ -131,6 +131,34 @@ class PreviewResponse(BaseModel):
     coordinates: List[List[float]]  # [[lon,lat], ...] for MapGL polyline
     length_m: float
 
+# ===== Recording schemas =====
+class RecordingStartReq(BaseModel):
+    author_id: Optional[int] = None
+
+class RecordingStartResp(BaseModel):
+    recording_id: str
+    started_at: datetime
+
+class RecordingPointReq(BaseModel):
+    lat: float
+    lon: float
+    ele: Optional[float] = None
+    ts: Optional[datetime] = None
+
+class RecordingLiveResp(BaseModel):
+    id: str
+    started_at: datetime
+    points: List[Point]
+    length_m: float
+
+class RecordingStopReq(BaseModel):
+    name: str
+    author_id: Optional[int] = None
+    tags: Optional[List[str]] = None
+
+class RecordingStopResp(BaseModel):
+    route: RoutePublic
+
 # =========================
 # Utils
 # =========================
@@ -205,11 +233,22 @@ def congestion_from_activities(db: Session, route_id: int, window_minutes: int =
     return level, score
 
 def points_to_json(points: List[Point]) -> str:
-    # pydantic v2
-    return json.dumps([p.model_dump() for p in points], ensure_ascii=False)
+    # В pydantic v2 JSON-совместимые типы даёт mode="json" (datetime -> ISO строка)
+    return json.dumps([p.model_dump(mode="json") for p in points], ensure_ascii=False)
 
 def json_to_points(js: str) -> List[Point]:
-    return [Point(**p) for p in json.loads(js)]
+    # Поддержка старых записей с ISO-строкой в ts
+    arr = json.loads(js)
+    out: List[Point] = []
+    for p in arr:
+        ts = p.get("ts")
+        if isinstance(ts, str):
+            try:
+                p["ts"] = datetime.fromisoformat(ts)
+            except Exception:
+                p["ts"] = None
+        out.append(Point(**p))
+    return out
 
 def weather_stub(route: Route, at: Optional[datetime]) -> WeatherAdvice:
     pts = json_to_points(route.geometry_json)
@@ -241,10 +280,9 @@ def health():
     return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
 
 # =========================
-# 2GIS Routing helpers
+# 2GIS Routing helpers (оставляем — используется в /routing/preview)
 # =========================
 def _parse_linestring(sel: Optional[str]) -> List[List[float]]:
-    """WKT 'LINESTRING(lon lat, ...)' -> [[lon,lat], ...]"""
     if not sel or "LINESTRING" not in sel:
         return []
     inner = sel.replace("LINESTRING(", "").rstrip(")")
@@ -262,7 +300,6 @@ async def _request_pair_route(
     transport: str,
     api_key: str
 ) -> List[List[float]]:
-    """Запрос маршрута между двумя точками. Если bicycle не даёт путь — пробуем walking."""
     async def do_req(tr: str) -> List[List[float]]:
         body = {
             "points": [
@@ -284,7 +321,6 @@ async def _request_pair_route(
         r0 = routes[0]
         coords: List[List[float]] = []
 
-        # возможные куски пути в ответе
         begin_sel = (((r0.get("begin_pedestrian_path") or {}).get("geometry") or {}).get("selection"))
         coords += _parse_linestring(begin_sel)
 
@@ -298,12 +334,11 @@ async def _request_pair_route(
 
     coords = await do_req(transport)
     if not coords and transport == "bicycle":
-        # fallback: попробуем walking, чтобы всё равно получить трек
         coords = await do_req("walking")
     return coords
 
 # =========================
-# /routing/preview: попарная маршрутизация и склейка
+# /routing/preview (склейка сегментов 2+)
 # =========================
 @app.post("/routing/preview", response_model=PreviewResponse)
 async def routing_preview(payload: PreviewRequest):
@@ -322,7 +357,6 @@ async def routing_preview(payload: PreviewRequest):
             segment = await _request_pair_route(client, a, b, payload.transport, DGIS_API_KEY)
 
             if not segment or len(segment) < 2:
-                # fallback — прямая между точками, чтобы не было «разрывов»
                 segment = [[a.lon, a.lat], [b.lon, b.lat]]
             else:
                 any_success = True
@@ -330,7 +364,6 @@ async def routing_preview(payload: PreviewRequest):
             if not merged:
                 merged.extend(segment)
             else:
-                # удалить дублирующуюся стыковочную вершину
                 if merged[-1] == segment[0]:
                     merged.extend(segment[1:])
                 else:
@@ -344,6 +377,81 @@ async def routing_preview(payload: PreviewRequest):
     length_m = compute_length(poly_pts)
 
     return PreviewResponse(coordinates=merged, length_m=round(length_m, 1))
+
+# =========================
+# In-memory Recording store (простая заглушка для сессий записи)
+# =========================
+class _Rec:
+    def __init__(self, rec_id: str, author_id: Optional[int]):
+        self.id = rec_id
+        self.author_id = author_id
+        self.started_at = datetime.now(timezone.utc)
+        self.points: List[Point] = []
+
+_RECORDINGS: Dict[str, _Rec] = {}
+
+# ===== Recording endpoints =====
+@app.post("/recordings/start", response_model=RecordingStartResp)
+def rec_start(payload: RecordingStartReq):
+    rec_id = uuid.uuid4().hex
+    _RECORDINGS[rec_id] = _Rec(rec_id, payload.author_id)
+    return RecordingStartResp(recording_id=rec_id, started_at=_RECORDINGS[rec_id].started_at)
+
+@app.post("/recordings/{rec_id}/point")
+def rec_point(rec_id: str, payload: RecordingPointReq):
+    rec = _RECORDINGS.get(rec_id)
+    if not rec:
+        raise HTTPException(404, "Recording not found")
+    p = Point(lat=payload.lat, lon=payload.lon, ele=payload.ele, ts=payload.ts or datetime.now(timezone.utc))
+    rec.points.append(p)
+    return {"ok": True, "count": len(rec.points)}
+
+@app.get("/recordings/{rec_id}/live", response_model=RecordingLiveResp)
+def rec_live(rec_id: str):
+    rec = _RECORDINGS.get(rec_id)
+    if not rec:
+        raise HTTPException(404, "Recording not found")
+    length_m = compute_length(rec.points)
+    return RecordingLiveResp(id=rec.id, started_at=rec.started_at, points=rec.points, length_m=round(length_m, 1))
+
+@app.post("/recordings/{rec_id}/stop", response_model=RecordingStopResp)
+def rec_stop(rec_id: str, payload: RecordingStopReq, db: Session = Depends(get_db)):
+    rec = _RECORDINGS.get(rec_id)
+    if not rec:
+        raise HTTPException(404, "Recording not found")
+    if len(rec.points) < 2:
+        raise HTTPException(400, "Недостаточно точек для маршрута")
+
+    points = rec.points
+    length_m = compute_length(points)
+    up, down = compute_elevation(points)
+
+    tags = set(normalize_tags(payload.tags))
+    tags |= set(keyword_autotags(payload.name, points))
+
+    route = Route(
+        name=payload.name,
+        author_id=payload.author_id if payload.author_id is not None else rec.author_id,
+        geometry_json=points_to_json(points),
+        length_m=round(length_m, 1),
+        elev_up_m=up,
+        elev_down_m=down,
+        tags_json=json.dumps(sorted(tags), ensure_ascii=False),
+    )
+    db.add(route); db.commit(); db.refresh(route)
+
+    level, score = congestion_from_activities(db, route.id)
+
+    # очистим сессию записи
+    _RECORDINGS.pop(rec_id, None)
+
+    rp = RoutePublic(
+        id=route.id, name=route.name, author_id=route.author_id, created_at=route.created_at,
+        points=points, length_m=route.length_m, elev_up_m=route.elev_up_m, elev_down_m=route.elev_down_m,
+        tags=json.loads(route.tags_json), avg_rating=route.avg_rating, ratings_count=route.ratings_count,
+        congestion_level=level, congestion_score=score
+    )
+    return RecordingStopResp(route=rp)
 
 # =========================
 # CRUD: routes, ratings, activities
